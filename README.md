@@ -168,7 +168,7 @@ The author takes no responsibility for misuse.
 ## Author
 
 **Amal K. A.**  
-Firmware Security Researcher · Offensive Hardware Developer  
+Security Researcher · Offensive Hardware Developer  
 [github.com/thecorruptedangel](https://github.com/thecorruptedangel) · [linkedin.com/in/amal-ka](https://linkedin.com/in/amal-ka)
 
 ---
