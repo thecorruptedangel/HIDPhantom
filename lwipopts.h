@@ -60,7 +60,7 @@
 #define LWIP_SINGLE_NETIF               1
 #define LWIP_NETIF_LINK_CALLBACK        1
 
-#define PBUF_POOL_SIZE                  4
+#define PBUF_POOL_SIZE                  24
 
 #define HTTPD_USE_CUSTOM_FSDATA         0
 

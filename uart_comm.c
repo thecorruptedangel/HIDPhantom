@@ -1,5 +1,6 @@
 #include "uart_comm.h"
 #include "usb_descriptors.h"
+#include "pico/mutex.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,10 @@
 static uart_buffer_t rx_buffer = {0};
 static volatile bool uart_initialized = false;
 static connected_device_status_t device_status = {0};
+
+// ---- Unified UART TX queue (Core-0 drains, any core enqueues under mutex) ----
+static uart_tx_queue_t uart_tx_queue = {0};
+static mutex_t         uart_tx_mutex;
 
 // CDC to UART queue for non-blocking forwarding
 static cdc_to_uart_queue_t cdc_to_uart_queue = {0};
@@ -52,6 +57,10 @@ void uart_comm_init(void) {
     uart_set_irq_enables(UART_ID, true, false);
 
     memset(&rx_buffer, 0, sizeof(rx_buffer));
+
+    // Unified TX queue — must be ready before Core 1 starts
+    memset(&uart_tx_queue, 0, sizeof(uart_tx_queue));
+    mutex_init(&uart_tx_mutex);
 
     // Initialize queues
     cdc_to_uart_queue_init();
@@ -206,43 +215,107 @@ void process_uart_to_cdc_queue(void) {
 
 // ========== ORIGINAL UART FUNCTIONS ==========
 
-void uart_send_hid_report(uint8_t report_id, const uint8_t* data, uint16_t len) {
-    if (!uart_initialized) return;
-
-    char header[16];
-    sprintf(header, "HID:%02X:%04X:", report_id, len);
-    uart_puts(UART_ID, header);
-
+// ---- Internal: enqueue bytes into TX queue, caller must hold uart_tx_mutex ----
+static void tx_enqueue_locked(const uint8_t* data, uint16_t len) {
+    uint16_t free = UART_TX_QUEUE_SIZE - uart_tx_queue.count;
+    if (len > free) return;  // drop rather than partial-write a frame
     for (uint16_t i = 0; i < len; i++) {
-        char hex_byte[4];
-        sprintf(hex_byte, "%02X", data[i]);
-        uart_puts(UART_ID, hex_byte);
+        uart_tx_queue.buffer[uart_tx_queue.tail] = data[i];
+        uart_tx_queue.tail = (uart_tx_queue.tail + 1) % UART_TX_QUEUE_SIZE;
+        uart_tx_queue.count++;
     }
-
-    uart_puts(UART_ID, "\r\n");
 }
 
+// Intercept copy of physical keyboard/mouse events sent to ESP8266 for logging.
+// The ACTUAL keyboard→host path (tud_hid_keyboard_report) runs over USB and is
+// completely unaffected by this function or any UART contention.
+void uart_send_hid_report(uint8_t report_id, const uint8_t* data, uint16_t len) {
+    if (!uart_initialized || !data || len == 0) return;
+
+    // Build full text frame in a local buffer — stack-safe (max ~155 bytes)
+    uint8_t frame[160];
+    uint16_t pos = 0;
+    pos += (uint16_t)snprintf((char*)frame + pos, sizeof(frame) - pos,
+                              "HID:%02X:%04X:", report_id, len);
+    for (uint16_t i = 0; i < len && pos < sizeof(frame) - 2; i++) {
+        pos += (uint16_t)snprintf((char*)frame + pos, sizeof(frame) - pos,
+                                  "%02X", data[i]);
+    }
+    if (pos < sizeof(frame) - 1) { frame[pos++] = '\r'; }
+    if (pos < sizeof(frame))     { frame[pos++] = '\n'; }
+
+    mutex_enter_blocking(&uart_tx_mutex);
+    tx_enqueue_locked(frame, pos);
+    mutex_exit(&uart_tx_mutex);
+}
+
+// Network packet from USB host → SLIP-encode and queue for ESP8266.
+// Runs on Core 0; uart_send_hid_report runs on Core 1 — mutex prevents interleave.
 void uart_send_net_packet(const uint8_t* packet, uint16_t len) {
-    if (!uart_initialized || packet == NULL || len == 0) return;
+    if (!uart_initialized || !packet || len == 0 || len > SLIP_MAX_FRAME) return;
 
-    // Format: NET:<length>:<hex_data>\r\n
-    char header[16];
-    sprintf(header, "NET:%04X:", len);
-    uart_puts(UART_ID, header);
+    // Worst-case encoded size: each byte becomes 2 after escaping, plus 2 END markers
+    uint16_t worst = len * 2 + 2;
 
-    for (uint16_t i = 0; i < len; i++) {
-        char hex_byte[4];
-        sprintf(hex_byte, "%02X", packet[i]);
-        uart_puts(UART_ID, hex_byte);
+    mutex_enter_blocking(&uart_tx_mutex);
+
+    if (UART_TX_QUEUE_SIZE - uart_tx_queue.count < worst) {
+        mutex_exit(&uart_tx_mutex);
+        return;  // queue full — drop packet, correct backpressure
     }
 
-    uart_puts(UART_ID, "\r\n");
+    // Write SLIP frame directly into queue under mutex (avoids stack allocation of ~3KB)
+#define TXQ_PUT(b) do { \
+    uart_tx_queue.buffer[uart_tx_queue.tail] = (b); \
+    uart_tx_queue.tail = (uart_tx_queue.tail + 1) % UART_TX_QUEUE_SIZE; \
+    uart_tx_queue.count++; \
+} while(0)
+
+    TXQ_PUT(SLIP_END);
+    for (uint16_t i = 0; i < len; i++) {
+        if (packet[i] == SLIP_END) {
+            TXQ_PUT(SLIP_ESC); TXQ_PUT(SLIP_ESC_END);
+        } else if (packet[i] == SLIP_ESC) {
+            TXQ_PUT(SLIP_ESC); TXQ_PUT(SLIP_ESC_ESC);
+        } else {
+            TXQ_PUT(packet[i]);
+        }
+    }
+    TXQ_PUT(SLIP_END);
+#undef TXQ_PUT
+
+    mutex_exit(&uart_tx_mutex);
 }
 
 void uart_send_response(const char* response) {
+    if (!uart_initialized || !response) return;
+    uint16_t len = (uint16_t)strlen(response);
+    mutex_enter_blocking(&uart_tx_mutex);
+    tx_enqueue_locked((const uint8_t*)response, len);
+    uint8_t crlf[2] = {'\r', '\n'};
+    tx_enqueue_locked(crlf, 2);
+    mutex_exit(&uart_tx_mutex);
+}
+
+// Called from Core 0 main loop — drains the TX queue into the UART FIFO.
+// Takes mutex only while copying a batch; writes to UART hardware without holding it.
+void uart_drain_tx_queue(void) {
     if (!uart_initialized) return;
-    uart_puts(UART_ID, response);
-    uart_puts(UART_ID, "\r\n");
+    uint8_t batch[32];
+    uint16_t n;
+    do {
+        mutex_enter_blocking(&uart_tx_mutex);
+        n = 0;
+        while (n < sizeof(batch) && uart_tx_queue.count > 0) {
+            batch[n++] = uart_tx_queue.buffer[uart_tx_queue.head];
+            uart_tx_queue.head = (uart_tx_queue.head + 1) % UART_TX_QUEUE_SIZE;
+            uart_tx_queue.count--;
+        }
+        mutex_exit(&uart_tx_mutex);
+        for (uint16_t i = 0; i < n; i++) {
+            uart_putc_raw(UART_ID, batch[i]);  // busy-waits for FIFO space (~0.35ms/32B at 921600)
+        }
+    } while (n == sizeof(batch));
 }
 
 void uart_set_net_packet_callback(net_packet_callback_t callback) {
@@ -374,32 +447,18 @@ static bool parse_hid_command(const char* cmd, uint8_t* report_id, uint8_t* data
     return true;
 }
 
-static bool parse_net_packet(const char* cmd, uint8_t* packet, uint16_t* len) {
-    // Format: NET:<length>:<hex_data>
-    if (strncmp(cmd, "NET:", 4) != 0) return false;
+// SLIP receive state — persistent across calls
+static uint8_t  slip_buf[SLIP_MAX_FRAME];
+static uint16_t slip_len       = 0;
+static bool     slip_in_frame  = false;
+static bool     slip_escape    = false;
 
-    char* ptr = (char*)cmd + 4;
-    char* end_ptr;
-
-    // Parse length field
-    *len = (uint16_t)strtol(ptr, &end_ptr, 16);
-    if (*end_ptr != ':') return false;
-
-    ptr = end_ptr + 1;
-
-    // Validate length (max 1500 bytes for MTU)
-    if (*len == 0 || *len > 1500) return false;
-
-    // Parse hex data
-    for (uint16_t i = 0; i < *len; i++) {
-        if (strlen(ptr) < 2) return false;
-
-        char hex_byte[3] = {ptr[0], ptr[1], '\0'};
-        packet[i] = (uint8_t)strtol(hex_byte, NULL, 16);
-        ptr += 2;
+static void slip_dispatch(void) {
+    if (slip_len > 0 && net_packet_callback && device_status.netbridge_mode_enabled) {
+        net_packet_callback(slip_buf, slip_len);
     }
-
-    return true;
+    slip_len = 0;
+    slip_escape = false;
 }
 
 static void process_at_command(const char* cmd) {
@@ -823,81 +882,88 @@ void uart_process_received_data(void) {
     while (uart_receive_data(temp_buffer, &temp_len) && temp_len > 0) {
         for (uint16_t i = 0; i < temp_len; i++) {
             uint8_t byte = temp_buffer[i];
-            char ch = (char)byte;
 
-            // Check if this is a printable ASCII character or line ending
-            bool is_text = (ch >= 0x20 && ch <= 0x7E) || ch == '\r' || ch == '\n' || ch == '\t';
-
-            if (is_text) {
-                // Text character - accumulate in line buffer
-                if (ch == '\r' || ch == '\n') {
-                    if (line_pos > 0) {
-                        line_buffer[line_pos] = '\0';
-
-                        // ALWAYS check for AT commands first (even in Serial Mode)
-                        if (strncmp(line_buffer, "AT", 2) == 0) {
-                            // Process AT command and send response back to ESP8266 via UART
-                            process_at_command(line_buffer);
-                            line_pos = 0;
-                            continue;  // Don't forward AT commands to CDC
-                        }
-
-                        // Check for SERIAL: command (framed serial monitor data with markers)
-                        // Format: SERIAL:CMD_START:<base64>:CMD_END
-                        // Forward to CDC as-is (no decoding) - PowerShell will decode
-                        if (strncmp(line_buffer, "SERIAL:", 7) == 0) {
-                            // Extract framed data after "SERIAL:" prefix
-                            const char* frame_data = line_buffer + 7;
-                            uint16_t frame_len = line_pos - 7;
-
-                            if (frame_len > 0 && device_status.serial_mode_enabled) {
-                                // Forward frame to CDC: "CMD_START:<base64>:CMD_END"
-                                uart_to_cdc_enqueue((uint8_t*)frame_data, frame_len);
-                                // Add line ending for compatibility
-                                uart_to_cdc_enqueue((uint8_t*)"\r\n", 2);
-                            }
-
-                            line_pos = 0;
-                            continue;  // SERIAL command handled, don't process further
-                        }
-
-                        // Check for NET: command (network packet from ESP8266)
-                        // Format: NET:<length>:<hex_data>
-                        // ALWAYS processed if netbridge enabled and callback is set
-                        static uint8_t net_packet_buffer[1500];  // MTU size
-                        uint16_t net_packet_len;
-
-                        if (parse_net_packet(line_buffer, net_packet_buffer, &net_packet_len)) {
-                            // Valid NET packet - forward to network stack if callback is set
-                            if (net_packet_callback != NULL && device_status.netbridge_mode_enabled) {
-                                net_packet_callback(net_packet_buffer, net_packet_len);
-                            }
-                            line_pos = 0;
-                            continue;  // NET command handled, don't process further
-                        }
-
-                        // Not an AT command - check if it's a HID command
-                        // HID commands are ALWAYS processed, regardless of Serial Mode
-                        uint8_t report_id;
-                        uint8_t hid_data[64];
-                        uint16_t hid_len;
-
-                        if (parse_hid_command(line_buffer, &report_id, hid_data, &hid_len)) {
-                            // Valid HID command - process it
-                            process_uart_hid_command(report_id, hid_data, hid_len);
-                        }
-                        // Otherwise: not AT, not SERIAL:, not NET, not HID - ignore (don't forward to CDC)
-
-                        line_pos = 0;
-                    }
-                } else if (line_pos < sizeof(line_buffer) - 1) {
-                    line_buffer[line_pos++] = ch;
+            // ---------- SLIP state machine (priority over text parser) ----------
+            if (byte == SLIP_END) {
+                if (slip_in_frame) {
+                    slip_dispatch();
                 }
+                slip_in_frame = true;
+                slip_escape   = false;
+                goto next_byte;
             }
-            // Binary bytes (non-text) are ignored - not forwarded to CDC
+            if (slip_in_frame) {
+                if (byte == SLIP_ESC) {
+                    slip_escape = true;
+                } else {
+                    uint8_t decoded;
+                    if (slip_escape) {
+                        decoded = (byte == SLIP_ESC_END) ? SLIP_END :
+                                  (byte == SLIP_ESC_ESC) ? SLIP_ESC : byte;
+                        slip_escape = false;
+                    } else {
+                        decoded = byte;
+                    }
+                    if (slip_len < SLIP_MAX_FRAME) {
+                        slip_buf[slip_len++] = decoded;
+                    } else {
+                        // Frame too large — stay in SLIP mode and discard remaining
+                        // bytes until the closing END. Do NOT fall through to text
+                        // parser: binary frame data would misparse as AT commands.
+                        slip_len    = 0;
+                        slip_escape = false;
+                        // slip_in_frame stays true; closing END will call
+                        // slip_dispatch() with slip_len==0, which is a no-op.
+                    }
+                }
+                goto next_byte;
+            }
 
+            // ---------- Text line parser (AT / HID / SERIAL commands) ----------
+            {
+                char ch = (char)byte;
+                bool is_text = (ch >= 0x20 && ch <= 0x7E) || ch == '\r' || ch == '\n' || ch == '\t';
+
+                if (is_text) {
+                    if (ch == '\r' || ch == '\n') {
+                        if (line_pos > 0) {
+                            line_buffer[line_pos] = '\0';
+
+                            if (strncmp(line_buffer, "AT", 2) == 0) {
+                                process_at_command(line_buffer);
+                                line_pos = 0;
+                                goto next_byte;
+                            }
+
+                            if (strncmp(line_buffer, "SERIAL:", 7) == 0) {
+                                const char* frame_data = line_buffer + 7;
+                                uint16_t frame_len = line_pos - 7;
+                                if (frame_len > 0 && device_status.serial_mode_enabled) {
+                                    uart_to_cdc_enqueue((uint8_t*)frame_data, frame_len);
+                                    uart_to_cdc_enqueue((uint8_t*)"\r\n", 2);
+                                }
+                                line_pos = 0;
+                                goto next_byte;
+                            }
+
+                            uint8_t report_id;
+                            uint8_t hid_data[64];
+                            uint16_t hid_len;
+                            if (parse_hid_command(line_buffer, &report_id, hid_data, &hid_len)) {
+                                process_uart_hid_command(report_id, hid_data, hid_len);
+                            }
+
+                            line_pos = 0;
+                        }
+                    } else if (line_pos < sizeof(line_buffer) - 1) {
+                        line_buffer[line_pos++] = ch;
+                    }
+                }
+                // Non-text, non-SLIP bytes are ignored
+            }
+
+            next_byte:
             bytes_processed++;
-            // Update watchdog periodically
             if (bytes_processed >= 64) {
                 watchdog_update();
                 bytes_processed = 0;

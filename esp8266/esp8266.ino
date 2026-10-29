@@ -97,6 +97,19 @@ netif_input_fn g_original_input = NULL;
 // Function declarations for network bridge
 extern "C" struct netif* eagle_lwip_getif(uint8_t index);
 
+// ========== SLIP CONSTANTS ==========
+#define SLIP_END      0xC0u
+#define SLIP_ESC      0xDBu
+#define SLIP_ESC_END  0xDCu
+#define SLIP_ESC_ESC  0xDDu
+#define SLIP_MAX_FRAME 1514u
+
+// SLIP receive state (persistent across processSerialData() calls)
+static uint8_t  slip_buf[SLIP_MAX_FRAME];
+static uint16_t slip_len      = 0;
+static bool     slip_in_frame = false;
+static bool     slip_escape   = false;
+
 // ========== IMAGE VIEWER STATE (from webimage_viewer MVP) ==========
 const uint8_t MARKER_START_IMG[] = {0xFF, 0xD8, 0xFF, 0xAA};  // Modified JPEG SOI
 const uint8_t MARKER_END_IMG[] = {0xFF, 0xD9, 0xFF, 0xBB};    // Modified JPEG EOI
@@ -1819,6 +1832,41 @@ void processSerialData() {
             continue;  // Skip all text processing below
         }
 
+        // ---------- SLIP frame handler (runs before text mode) ----------
+        // 0xC0 and 0xDB are non-ASCII; they don't appear in AT/HID text commands.
+        if (byte == SLIP_END) {
+            if (slip_in_frame && slip_len > 0) {
+                // Dispatch complete SLIP frame → inject into WiFi AP
+                inject_packet_from_uart(slip_buf, slip_len);
+            }
+            slip_in_frame = true;
+            slip_len      = 0;
+            slip_escape   = false;
+            continue;
+        }
+        if (slip_in_frame) {
+            if (byte == SLIP_ESC) {
+                slip_escape = true;
+            } else {
+                uint8_t decoded;
+                if (slip_escape) {
+                    decoded     = (byte == SLIP_ESC_END) ? SLIP_END :
+                                  (byte == SLIP_ESC_ESC) ? SLIP_ESC : byte;
+                    slip_escape = false;
+                } else {
+                    decoded = byte;
+                }
+                if (slip_len < SLIP_MAX_FRAME) {
+                    slip_buf[slip_len++] = decoded;
+                } else {
+                    // Frame too large — reset
+                    slip_in_frame = false;
+                    slip_len      = 0;
+                }
+            }
+            continue;
+        }
+
         // Screenshot modal is closed - TEXT MODE ONLY
         // Process as text for HID/AT commands
         char c = (char)byte;
@@ -1879,13 +1927,6 @@ void processSerialData() {
             if (lineBuffer.length() > 0) {
                 // Process normal lines (HID/AT/NET commands)
                 String processedLine = "";
-
-                // Check for NET: packet (network bridge) - process and don't echo
-                if (lineBuffer.startsWith("NET:")) {
-                    handle_net_packet_from_uart(lineBuffer);
-                    lineBuffer = "";
-                    continue;  // NET packet handled, don't process further
-                }
 
                 if (lineBuffer.startsWith("HID:")) {
                     processedLine = processHIDMessage(lineBuffer);
@@ -2331,39 +2372,33 @@ bool should_forward_to_uart_from_pbuf(struct pbuf* p) {
             (dest_ip == rp2040_ip));
 }
 
-// Forward pbuf packet to UART as NET:<length>:<hex> command
+// Forward pbuf to RP2040 via SLIP framing
 void forward_pbuf_to_uart(struct pbuf* p) {
     uint16_t total_len = p->tot_len;
+    if (total_len == 0 || total_len > SLIP_MAX_FRAME) return;
 
-    // Check memory availability
-    if (ESP.getFreeHeap() < 8192) {
-        Serial.println("[NET-BRIDGE] Low memory - dropping outbound packet");
-        return;
-    }
+    if (ESP.getFreeHeap() < 8192) return;  // low-memory guard
 
-    // Allocate temporary buffer for packet
-    uint8_t* packet_buf = (uint8_t*)malloc(total_len);
-    if (packet_buf == NULL) {
-        Serial.println("[NET-BRIDGE] Failed to allocate packet buffer");
-        return;
-    }
+    uint8_t* buf = (uint8_t*)malloc(total_len);
+    if (!buf) return;
 
-    // Copy pbuf chain into contiguous buffer
-    pbuf_copy_partial(p, packet_buf, total_len, 0);
+    pbuf_copy_partial(p, buf, total_len, 0);
 
-    // Send to RP2040 via UART in NET:<length>:<hex> format
-    Serial.print("NET:");
-    Serial.printf("%04X", total_len);
-    Serial.print(":");
-
+    Serial.write(SLIP_END);
     for (uint16_t i = 0; i < total_len; i++) {
-        Serial.printf("%02X", packet_buf[i]);
+        if (buf[i] == SLIP_END) {
+            Serial.write(SLIP_ESC);
+            Serial.write(SLIP_ESC_END);
+        } else if (buf[i] == SLIP_ESC) {
+            Serial.write(SLIP_ESC);
+            Serial.write(SLIP_ESC_ESC);
+        } else {
+            Serial.write(buf[i]);
+        }
     }
+    Serial.write(SLIP_END);
 
-    Serial.print("\r\n");
-    Serial.flush();
-
-    free(packet_buf);
+    free(buf);
 }
 
 // Custom netif input callback for WiFi → lwIP interception
@@ -2429,59 +2464,6 @@ void inject_packet_from_uart(const uint8_t* packet_data, uint16_t len) {
         pbuf_free(p);
     }
     // Note: Don't free pbuf on success - lwIP takes ownership
-}
-
-// Parse NET: command from UART and inject into WiFi
-void handle_net_packet_from_uart(const String& line) {
-    if (!line.startsWith("NET:")) return;
-
-    // Format: NET:<length_hex>:<hex_data>
-    int firstColon = line.indexOf(':', 4);
-    if (firstColon < 0) {
-        Serial.println("[NET-BRIDGE] Invalid NET packet format (no first colon)");
-        return;
-    }
-
-    int secondColon = line.indexOf(':', firstColon + 1);
-    if (secondColon < 0) {
-        Serial.println("[NET-BRIDGE] Invalid NET packet format (no second colon)");
-        return;
-    }
-
-    // Parse length field (hex)
-    String lenStr = line.substring(4, firstColon);
-    uint16_t packet_len = (uint16_t)strtol(lenStr.c_str(), NULL, 16);
-
-    if (packet_len == 0 || packet_len > 1514) {
-        Serial.printf("[NET-BRIDGE] Invalid packet length: %d\n", packet_len);
-        return;
-    }
-
-    // Parse hex data
-    String hexData = line.substring(secondColon + 1);
-    if (hexData.length() != packet_len * 2) {
-        Serial.printf("[NET-BRIDGE] Hex data length mismatch: expected %d, got %d\n",
-                      packet_len * 2, hexData.length());
-        return;
-    }
-
-    // Allocate buffer for packet
-    uint8_t* packet_buf = (uint8_t*)malloc(packet_len);
-    if (packet_buf == NULL) {
-        Serial.println("[NET-BRIDGE] Failed to allocate packet buffer for injection");
-        return;
-    }
-
-    // Convert hex string to binary
-    for (uint16_t i = 0; i < packet_len; i++) {
-        String byteStr = hexData.substring(i * 2, i * 2 + 2);
-        packet_buf[i] = (uint8_t)strtol(byteStr.c_str(), NULL, 16);
-    }
-
-    // Inject packet into WiFi
-    inject_packet_from_uart(packet_buf, packet_len);
-
-    free(packet_buf);
 }
 
 // Install network bridge hooks on AP interface

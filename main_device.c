@@ -101,7 +101,8 @@ int main(void) {
     while (true) {
         tud_task();
         uart_process_received_data();
-        process_cdc_to_uart_queue();  // Process queued CDC→UART data non-blocking
+        uart_drain_tx_queue();        // Drain unified TX queue (HID intercepts + NET packets + AT responses)
+        process_cdc_to_uart_queue();  // Process queued CDC→UART data non-blocking (serial mode only)
         process_uart_to_cdc_queue();  // Process queued UART→CDC data non-blocking
 
         // Process network stack timers when network mode is enabled

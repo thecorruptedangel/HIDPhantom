@@ -136,7 +136,7 @@ The entire device fits in a thumb-drive form factor.
 | OTA firmware delivery | ✅ Complete |
 | Dual-image unbrick system (GPIO trigger) | ✅ Complete |
 | Web-based C2 interface (ESP8266 AP/STA) | ✅ Complete |
-| RNDIS network bridging | 🔄 In Progress |
+| RNDIS network bridging (USB ↔ ESP8266 WiFi) | ✅ Complete |
 | Screenshot-over-Serial | ✅ Complete |
 | Custom PCB (miniaturised form factor) | 📋 Planned |
 

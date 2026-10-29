@@ -18,7 +18,15 @@
 // #define UART_TX_PIN 4
 // #define UART_RX_PIN 5
 
-#define UART_BUFFER_SIZE 512
+// Ring buffer large enough to buffer a full SLIP frame (1514 bytes) between polls
+#define UART_BUFFER_SIZE 4096
+
+// SLIP framing constants (RFC 1055)
+#define SLIP_END      0xC0u
+#define SLIP_ESC      0xDBu
+#define SLIP_ESC_END  0xDCu
+#define SLIP_ESC_ESC  0xDDu
+#define SLIP_MAX_FRAME 1514u  // Max Ethernet frame size
 
 typedef struct {
     uint8_t buffer[UART_BUFFER_SIZE];
@@ -26,6 +34,18 @@ typedef struct {
     uint16_t tail;
     uint16_t count;
 } uart_buffer_t;
+
+// Unified UART TX queue — all outgoing UART traffic serialized here.
+// Sized for 2 max SLIP frames (worst-case fully escaped: 1514*2+2 = 3030 bytes each)
+// plus headroom for concurrent AT responses and HID intercept copies.
+#define UART_TX_QUEUE_SIZE 8192
+
+typedef struct {
+    uint8_t buffer[UART_TX_QUEUE_SIZE];
+    volatile uint16_t head;
+    volatile uint16_t tail;
+    volatile uint16_t count;
+} uart_tx_queue_t;
 
 // CDC to UART queue for non-blocking forwarding
 #define CDC_TO_UART_QUEUE_SIZE 4096
@@ -77,6 +97,7 @@ void uart_send_response(const char* response);
 bool uart_receive_data(uint8_t* buffer, uint16_t* len);
 void uart_process_received_data(void);
 void uart_send_device_status_update(void);
+void uart_drain_tx_queue(void);
 connected_device_status_t* get_connected_device_status(void);
 
 // Network packet forwarding over UART
