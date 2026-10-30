@@ -254,8 +254,8 @@ void uart_send_hid_report(uint8_t report_id, const uint8_t* data, uint16_t len) 
 void uart_send_net_packet(const uint8_t* packet, uint16_t len) {
     if (!uart_initialized || !packet || len == 0 || len > SLIP_MAX_FRAME) return;
 
-    // Worst-case encoded size: each byte becomes 2 after escaping, plus 2 END markers
-    uint16_t worst = len * 2 + 2;
+    // Worst-case encoded size: each byte becomes 2 after escaping, plus 2 END markers + 1 type byte
+    uint16_t worst = len * 2 + 3;
 
     mutex_enter_blocking(&uart_tx_mutex);
 
@@ -272,6 +272,7 @@ void uart_send_net_packet(const uint8_t* packet, uint16_t len) {
 } while(0)
 
     TXQ_PUT(SLIP_END);
+    TXQ_PUT(SLIP_TYPE_NET);  // Frame-type discriminator — lets ESP8266 distinguish NET from image frames
     for (uint16_t i = 0; i < len; i++) {
         if (packet[i] == SLIP_END) {
             TXQ_PUT(SLIP_ESC); TXQ_PUT(SLIP_ESC_END);
@@ -297,25 +298,27 @@ void uart_send_response(const char* response) {
     mutex_exit(&uart_tx_mutex);
 }
 
-// Called from Core 0 main loop — drains the TX queue into the UART FIFO.
-// Takes mutex only while copying a batch; writes to UART hardware without holding it.
+// Called from Core 0 main loop — drains one 32-byte batch from the TX queue.
+// One batch per call keeps Core 0 blocked for at most ~0.35ms (one FIFO depth at
+// 921600 baud). The main loop runs far faster than the UART byte rate so the full
+// queue drains across successive iterations without losing throughput.
 void uart_drain_tx_queue(void) {
     if (!uart_initialized) return;
     uint8_t batch[32];
     uint16_t n;
-    do {
-        mutex_enter_blocking(&uart_tx_mutex);
-        n = 0;
-        while (n < sizeof(batch) && uart_tx_queue.count > 0) {
-            batch[n++] = uart_tx_queue.buffer[uart_tx_queue.head];
-            uart_tx_queue.head = (uart_tx_queue.head + 1) % UART_TX_QUEUE_SIZE;
-            uart_tx_queue.count--;
-        }
-        mutex_exit(&uart_tx_mutex);
-        for (uint16_t i = 0; i < n; i++) {
-            uart_putc_raw(UART_ID, batch[i]);  // busy-waits for FIFO space (~0.35ms/32B at 921600)
-        }
-    } while (n == sizeof(batch));
+
+    mutex_enter_blocking(&uart_tx_mutex);
+    n = 0;
+    while (n < sizeof(batch) && uart_tx_queue.count > 0) {
+        batch[n++] = uart_tx_queue.buffer[uart_tx_queue.head];
+        uart_tx_queue.head = (uart_tx_queue.head + 1) % UART_TX_QUEUE_SIZE;
+        uart_tx_queue.count--;
+    }
+    mutex_exit(&uart_tx_mutex);
+
+    for (uint16_t i = 0; i < n; i++) {
+        uart_putc_raw(UART_ID, batch[i]);
+    }
 }
 
 void uart_set_net_packet_callback(net_packet_callback_t callback) {
@@ -845,18 +848,34 @@ static void process_uart_hid_command(uint8_t report_id, const uint8_t* data, uin
 }
 
 bool uart_receive_data(uint8_t* buffer, uint16_t* len) {
-    if (!uart_initialized || rx_buffer.count == 0) {
+    if (!uart_initialized) {
         *len = 0;
         return false;
     }
 
-    uint16_t available = rx_buffer.count < *len ? rx_buffer.count : *len;
+    // Cortex-M0+ has no atomic RMW: count-- is three instructions (LDRH/SUB/STRH)
+    // and the UART ISR can increment count between them, losing its update.
+    // Mask the UART IRQ for the two short critical sections (read + write of count).
+    const uint irq_num = UART_ID == uart0 ? UART0_IRQ : UART1_IRQ;
+
+    irq_set_enabled(irq_num, false);
+    uint16_t available = rx_buffer.count;
+    irq_set_enabled(irq_num, true);
+
+    if (available == 0) {
+        *len = 0;
+        return false;
+    }
+    if (available > *len) available = *len;
 
     for (uint16_t i = 0; i < available; i++) {
         buffer[i] = rx_buffer.buffer[rx_buffer.head];
         rx_buffer.head = (rx_buffer.head + 1) % UART_BUFFER_SIZE;
-        rx_buffer.count--;
     }
+
+    irq_set_enabled(irq_num, false);
+    rx_buffer.count -= available;
+    irq_set_enabled(irq_num, true);
 
     *len = available;
     return true;

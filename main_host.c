@@ -86,7 +86,11 @@ void core1_main() {
         
         if (has_report) {
             mutex_enter_blocking(&state_mutex);
-            bool can_process = device_connected && !device_reset_in_progress;
+            // In hybrid mode (DESC_TYPE_COMPOSITE) the virtual keyboard must work
+            // even when no target device is connected.  Physical-device-only modes
+            // still require a connected device so we don't forward stale reports.
+            bool allow_virtual = (current_descriptor_type == DESC_TYPE_COMPOSITE);
+            bool can_process = (device_connected || allow_virtual) && !device_reset_in_progress;
             mutex_exit(&state_mutex);
 
             if (can_process) {
@@ -224,8 +228,7 @@ void tuh_mount_cb(uint8_t dev_addr) {
 
     mutex_exit(&state_mutex);
 
-    // Send device status update to ESP8266 for real-time UI update
-    sleep_ms(100);  // Small delay to ensure UART is ready
+    // Send device status update to ESP8266
     uart_send_device_status_update();
 }
 
@@ -269,10 +272,19 @@ void tuh_umount_cb(uint8_t dev_addr) {
         connected_dev_addr = 0;
         
         
-        // Clear device status
+        // Clear device-specific fields but preserve user-configured mode flags so
+        // a hot-unplug does not silently disable the network bridge or hybrid mode.
         connected_device_status_t* status = get_connected_device_status();
+        bool preserve_hybrid    = status->hybrid_mode_enabled;
+        bool preserve_serial    = status->serial_mode_enabled;
+        bool preserve_storage   = status->storage_mode_enabled;
+        bool preserve_netbridge = status->netbridge_mode_enabled;
         memset(status, 0, sizeof(connected_device_status_t));
-        status->connected = false;
+        status->connected              = false;
+        status->hybrid_mode_enabled    = preserve_hybrid;
+        status->serial_mode_enabled    = preserve_serial;
+        status->storage_mode_enabled   = preserve_storage;
+        status->netbridge_mode_enabled = preserve_netbridge;
 
         // Reset to default descriptor
         set_descriptor_type(DESC_TYPE_DEFAULT);
@@ -282,8 +294,7 @@ void tuh_umount_cb(uint8_t dev_addr) {
 
         mutex_exit(&state_mutex);
 
-        // Send device disconnected notification to ESP8266 for real-time UI update
-        sleep_ms(100);  // Small delay to ensure UART is ready
+        // Send device disconnected notification to ESP8266
         uart_send_device_status_update();
     } else {
         mutex_exit(&state_mutex);

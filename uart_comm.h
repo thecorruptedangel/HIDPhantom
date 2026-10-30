@@ -28,6 +28,12 @@
 #define SLIP_ESC_ESC  0xDDu
 #define SLIP_MAX_FRAME 1514u  // Max Ethernet frame size
 
+// First byte of every SLIP frame payload — disambiguates frame types on ESP8266
+#define SLIP_TYPE_NET       0x00u   // Ethernet frame → lwIP injection
+#define SLIP_TYPE_IMG_START 0x01u   // Begin image transfer
+#define SLIP_TYPE_IMG_DATA  0x02u   // Image data chunk (payload follows type byte)
+#define SLIP_TYPE_IMG_END   0x03u   // End image transfer
+
 typedef struct {
     uint8_t buffer[UART_BUFFER_SIZE];
     uint16_t head;
@@ -36,7 +42,7 @@ typedef struct {
 } uart_buffer_t;
 
 // Unified UART TX queue — all outgoing UART traffic serialized here.
-// Sized for 2 max SLIP frames (worst-case fully escaped: 1514*2+2 = 3030 bytes each)
+// Sized for 2 max SLIP frames (worst-case fully escaped: 1514*2+3 = 3031 bytes each)
 // plus headroom for concurrent AT responses and HID intercept copies.
 #define UART_TX_QUEUE_SIZE 8192
 

@@ -109,14 +109,45 @@ static uint8_t  slip_buf[SLIP_MAX_FRAME];
 static uint16_t slip_len      = 0;
 static bool     slip_in_frame = false;
 static bool     slip_escape   = false;
+static bool     slip_overflow = false;  // Frame exceeded SLIP_MAX_FRAME — discard on next END
 
-// ========== IMAGE VIEWER STATE (from webimage_viewer MVP) ==========
-const uint8_t MARKER_START_IMG[] = {0xFF, 0xD8, 0xFF, 0xAA};  // Modified JPEG SOI
-const uint8_t MARKER_END_IMG[] = {0xFF, 0xD9, 0xFF, 0xBB};    // Modified JPEG EOI
+// SLIP TX queue: network callback encodes frames here; main loop drains to Serial
+// Avoids blocking Serial.write() inside the lwIP receive path
+#define SLIP_TX_QUEUE_SIZE 8192
+static uint8_t           slip_tx_queue[SLIP_TX_QUEUE_SIZE];
+static volatile uint16_t slip_tx_head = 0;
+static volatile uint16_t slip_tx_tail = 0;
+
+static bool slip_tx_put(uint8_t b) {
+    uint16_t next = (slip_tx_tail + 1) % SLIP_TX_QUEUE_SIZE;
+    if (next == slip_tx_head) return false;  // queue full — drop byte
+    slip_tx_queue[slip_tx_tail] = b;
+    slip_tx_tail = next;
+    return true;
+}
+
+void drain_slip_tx_queue() {
+    uint8_t batch[64];
+    uint8_t n = 0;
+    while (slip_tx_head != slip_tx_tail && n < sizeof(batch)) {
+        batch[n++] = slip_tx_queue[slip_tx_head];
+        slip_tx_head = (slip_tx_head + 1) % SLIP_TX_QUEUE_SIZE;
+    }
+    if (n > 0) Serial.write(batch, n);
+}
+
+// ========== IMAGE VIEWER STATE ==========
+// WebSocket markers sent to the browser to delimit the image stream
+const uint8_t MARKER_START_IMG[] = {0xFF, 0xD8, 0xFF, 0xAA};
+const uint8_t MARKER_END_IMG[]   = {0xFF, 0xD9, 0xFF, 0xBB};
 #define MARKER_SIZE_IMG 4
 
-uint8_t markerBuffer[MARKER_SIZE_IMG];
-int markerPos = 0;
+// SLIP frame type bytes (must match uart_comm.h on RP2040 side)
+#define SLIP_TYPE_NET       0x00u
+#define SLIP_TYPE_IMG_START 0x01u
+#define SLIP_TYPE_IMG_DATA  0x02u
+#define SLIP_TYPE_IMG_END   0x03u
+
 bool inImageTransfer = false;
 unsigned long imageBytesReceived = 0;
 
@@ -341,9 +372,15 @@ String getScriptSettingsJSON() {
     return json;
 }
 
-// HID callback for PhantomScript to send commands to RP2040
+// HID callback for PhantomScript to send commands to RP2040.
+// Also services UART and WebSocket between keystrokes so the network
+// bridge and C2 connection stay alive during script execution.
 void sendHIDToRP2040(const char* hidCommand) {
     Serial.print(hidCommand);
+    drain_slip_tx_queue();
+    processSerialData();
+    sendBufferedData();
+    yield();
 }
 
 // Get script info
@@ -835,28 +872,20 @@ bool saveAPConfig(const String& ssid, const String& password) {
 // ========== OTA RECOVERY MODE ==========
 
 void performOTARecovery() {
-    Serial.begin(115200);
-    delay(100);
+    // Serial is already initialized at 921600 by setup() before we are called.
+    // Do NOT call Serial.begin() again - it would reset to a different baud rate.
 
     Serial.println("\n\n========================================");
     Serial.println("  OTA RECOVERY MODE");
     Serial.println("  Flashing firmware...");
     Serial.println("========================================");
 
-    // Initialize LittleFS
-    if (!LittleFS.begin()) {
-        Serial.println("ERROR: Failed to mount LittleFS");
-        delay(2000);
-        ESP.restart();
-        return;
-    }
-
-    // Remove flag file
+    // LittleFS already mounted by setup() before we are called.
+    // Remove flag file so a crash during flashing doesn't loop into recovery forever.
     if (LittleFS.exists(OTA_FLAG_FILE)) {
         LittleFS.remove(OTA_FLAG_FILE);
     }
 
-    // Check if firmware file exists
     if (!LittleFS.exists(OTA_FIRMWARE_FILE)) {
         Serial.println("ERROR: Firmware file not found");
         delay(2000);
@@ -876,7 +905,6 @@ void performOTARecovery() {
     Serial.printf("Firmware size: %u bytes\n", fileSize);
     Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
 
-    // Validate size
     if (fileSize < 100000) {
         Serial.printf("ERROR: Firmware too small (%u bytes) - likely corrupt\n", fileSize);
         firmware.close();
@@ -886,7 +914,15 @@ void performOTARecovery() {
         return;
     }
 
-    // Begin update
+    if (fileSize > ESP.getFreeSketchSpace()) {
+        Serial.printf("ERROR: Firmware (%u bytes) exceeds free sketch space (%u bytes)\n",
+                      fileSize, ESP.getFreeSketchSpace());
+        firmware.close();
+        delay(2000);
+        ESP.restart();
+        return;
+    }
+
     if (!Update.begin(fileSize, U_FLASH)) {
         Serial.println("ERROR: Update.begin() failed");
         Update.printError(Serial);
@@ -898,7 +934,10 @@ void performOTARecovery() {
 
     Serial.println("Writing firmware to flash...");
 
-    // Write firmware in chunks
+    // Disable hardware WDT for the entire flash loop - re-enable after.
+    // We feed the software WDT via yield() each iteration instead.
+    ESP.wdtDisable();
+
     uint8_t buffer[512];
     size_t written = 0;
     unsigned long lastPrint = 0;
@@ -908,61 +947,58 @@ void performOTARecovery() {
         size_t bytesRead = firmware.read(buffer, toRead);
 
         if (bytesRead > 0) {
-            ESP.wdtDisable();
             size_t bytesWritten = Update.write(buffer, bytesRead);
-            ESP.wdtEnable(5000);
-
             if (bytesWritten != bytesRead) {
                 Serial.printf("ERROR: Write failed - wrote %u of %u bytes\n", bytesWritten, bytesRead);
+                ESP.wdtEnable(0);
                 firmware.close();
                 delay(2000);
                 ESP.restart();
                 return;
             }
-
             written += bytesWritten;
 
-            // Print progress every 500ms
             if (millis() - lastPrint > 500) {
                 Serial.printf("Progress: %u / %u bytes (%.1f%%)\n",
-                    written, fileSize, (written * 100.0) / fileSize);
+                    written, fileSize, (written * 100.0f) / fileSize);
                 lastPrint = millis();
             }
         }
 
-        yield();
+        yield();  // software WDT feed; also lets SDK background tasks run
     }
 
+    ESP.wdtEnable(0);  // re-enable hardware WDT
     firmware.close();
 
     Serial.printf("Total written: %u bytes\n", written);
     Serial.println("Finalizing update...");
 
-    // Finalize update
-    if (Update.end(true)) {
-        if (Update.isFinished()) {
-            Serial.println("========================================");
-            Serial.println("UPDATE SUCCESSFUL!");
-            Serial.println("========================================");
-
-            // Delete firmware file
-            LittleFS.remove(OTA_FIRMWARE_FILE);
-
-            Serial.println("Rebooting to new firmware in 3 seconds...");
-            delay(3000);
-            ESP.restart();
-        } else {
-            Serial.println("ERROR: Update not finished");
-            Update.printError(Serial);
-            delay(2000);
-            ESP.restart();
-        }
-    } else {
+    if (!Update.end(true)) {
         Serial.println("ERROR: Update.end() failed");
         Update.printError(Serial);
         delay(2000);
         ESP.restart();
+        return;
     }
+
+    if (!Update.isFinished()) {
+        Serial.println("ERROR: Update not finished after end()");
+        Update.printError(Serial);
+        delay(2000);
+        ESP.restart();
+        return;
+    }
+
+    Serial.println("========================================");
+    Serial.println("UPDATE SUCCESSFUL!");
+    Serial.println("========================================");
+
+    LittleFS.remove(OTA_FIRMWARE_FILE);
+
+    Serial.println("Rebooting to new firmware...");
+    delay(1000);
+    ESP.restart();
 }
 
 
@@ -1605,13 +1641,15 @@ void onWsImageEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
         inImageTransfer = false;
         imageBytesReceived = 0;
         wsImageBufferPos = 0;
-        markerPos = 0;
-        memset(markerBuffer, 0, MARKER_SIZE_IMG);
-        // Clear text buffers too
+        // Reset SLIP parser state so a stale mid-frame doesn't eat text after close
+        slip_in_frame = false;
+        slip_len      = 0;
+        slip_escape   = false;
+        slip_overflow = false;
         outputBuffer = "";
         lineBuffer = "";
         serialMonitorBuffer = "";
-        Serial.println("[wsImage] Switched to BINARY MODE - ready for image data");
+        Serial.println("[wsImage] Screenshot modal open - ready for image data");
     } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("\n========================================\n");
         Serial.printf("[wsImage] Client #%u disconnected\n", client->id());
@@ -1622,12 +1660,14 @@ void onWsImageEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
             inImageTransfer = false;
             imageBytesReceived = 0;
             wsImageBufferPos = 0;
-            markerPos = 0;
-            memset(markerBuffer, 0, MARKER_SIZE_IMG);
+            slip_in_frame = false;
+            slip_len      = 0;
+            slip_escape   = false;
+            slip_overflow = false;
             outputBuffer = "";
             lineBuffer = "";
             serialMonitorBuffer = "";
-            Serial.println("[wsImage] Modal closed - switched to TEXT MODE");
+            Serial.println("[wsImage] Screenshot modal closed");
         }
     }
     // No text message handling needed - binary only
@@ -1650,198 +1690,142 @@ public:
     }
 };
 
-// ========== SERIAL DATA PROCESSING (UNCHANGED) ==========
+// ========== IMAGE TRANSFER VIA SLIP ==========
+// Image data arrives as typed SLIP frames from the VBS script on the target.
+// The RP2040 passes CDC bytes straight through to UART, so the SLIP frames
+// produced by the VBS arrive intact at the ESP8266's SLIP handler.
+// Frame types: 0x01=IMG_START  0x02=IMG_DATA  0x03=IMG_END
+// NET frames use type 0x00 and are dispatched to the lwIP injector.
 
-// ========== IMAGE VIEWER FUNCTIONS (from webimage_viewer MVP) ==========
+static void flushImageWSBuffer() {
+    if (wsImageBufferPos == 0) return;
 
-void flushImageWSBuffer() {
-    if (wsImageBufferPos > 0) {
-        // Check if any clients are connected to image WebSocket
-        if (wsImage.count() == 0) {
-            Serial.println("[WARN] No clients connected to image WebSocket, clearing buffer");
-            wsImageBufferPos = 0;
-            markerPos = 0;
-            inImageTransfer = false;
-            return;
-        }
-
-        // Memory guard: Check free heap before sending
-        if (ESP.getFreeHeap() < 8192) {
-            Serial.printf("[WARN] Low memory (%u bytes), skipping binary send\n", ESP.getFreeHeap());
-            wsImageBufferPos = 0;
-            return;
-        }
-
-        // Check buffer size is valid
-        if (wsImageBufferPos > WS_IMAGE_CHUNK_SIZE) {
-            Serial.printf("[ERROR] Buffer overflow detected: %d > %d\n", wsImageBufferPos, WS_IMAGE_CHUNK_SIZE);
-            wsImageBufferPos = 0;
-            markerPos = 0;
-            inImageTransfer = false;
-            return;
-        }
-
-        // CRITICAL: Feed watchdog before potentially blocking WebSocket operation
-        ESP.wdtFeed();
-
-        // Send to image WebSocket
-        wsImage.binaryAll(wsImageBuffer, wsImageBufferPos);
-
-        yield();  // Allow other tasks to run
-        delay(5);  // Rate limiting: prevents overwhelming WebSocket (~200KB/sec max)
-
+    if (wsImage.count() == 0) {
         wsImageBufferPos = 0;
+        return;
+    }
+    if (ESP.getFreeHeap() < 8192) {
+        Serial.printf("[IMG] Low heap (%u B), dropping chunk\n", ESP.getFreeHeap());
+        wsImageBufferPos = 0;
+        return;
+    }
+
+    ESP.wdtFeed();
+    wsImage.binaryAll(wsImageBuffer, wsImageBufferPos);
+    yield();
+    delay(5);  // rate-limit WebSocket output (~200 KB/s max)
+    wsImageBufferPos = 0;
+}
+
+// Called when SLIP_TYPE_IMG_START frame arrives
+static void handleImageStart() {
+    wsImageBufferPos = 0;  // Discard any stale partial-transfer bytes (do NOT send to browser)
+    inImageTransfer   = true;
+    imageBytesReceived = 0;
+    outputBuffer = "";
+    lineBuffer   = "";
+
+    if (wsImage.count() > 0) {
+        wsImage.binaryAll(MARKER_START_IMG, MARKER_SIZE_IMG);
+        yield();
+        Serial.println("[IMG] Transfer started");
+    } else {
+        Serial.println("[IMG] Transfer started (modal closed - data will be discarded)");
     }
 }
 
-void addToImageWSBuffer(const uint8_t* data, int len) {
-    for (int i = 0; i < len; i++) {
+// Called for each SLIP_TYPE_IMG_DATA frame
+static void handleImageData(const uint8_t* data, uint16_t len) {
+    if (!inImageTransfer) return;
+    if (wsImage.count() == 0) {
+        // Modal closed mid-transfer: keep counting but discard bytes
+        imageBytesReceived += len;
+        return;
+    }
+    for (uint16_t i = 0; i < len; i++) {
         wsImageBuffer[wsImageBufferPos++] = data[i];
-
+        imageBytesReceived++;
         if (wsImageBufferPos >= WS_IMAGE_CHUNK_SIZE) {
             flushImageWSBuffer();
+            yield();
+            ESP.wdtFeed();
         }
     }
 }
 
-bool checkImageMarker(const uint8_t* marker) {
-    for (int i = 0; i < MARKER_SIZE_IMG; i++) {
-        if (markerBuffer[i] != marker[i]) return false;
+// Called when SLIP_TYPE_IMG_END frame arrives
+static void handleImageEnd() {
+    if (!inImageTransfer) return;
+    flushImageWSBuffer();
+    inImageTransfer = false;
+
+    if (wsImage.count() > 0) {
+        wsImage.binaryAll(MARKER_END_IMG, MARKER_SIZE_IMG);
+        yield();
+        Serial.printf("[IMG] Transfer complete: %lu bytes\n", imageBytesReceived);
+    } else {
+        Serial.printf("[IMG] Transfer complete (discarded): %lu bytes\n", imageBytesReceived);
     }
-    return true;
+    imageBytesReceived = 0;
 }
 
-void processSerialByteForImage(uint8_t byte) {
-    // CRITICAL: Always process bytes to detect END marker, even if modal closed
-    // This prevents getting stuck in binary mode when user closes modal mid-transfer
+// SLIP frame dispatcher — called once per complete SLIP frame received on UART.
+// buf[0] is the frame-type byte; payload starts at buf+1.
+void dispatch_slip_frame(const uint8_t* buf, uint16_t len) {
+    if (len == 0) return;
 
-    // Add byte to marker buffer
-    markerBuffer[markerPos] = byte;
-    markerPos++;
+    uint8_t ftype = buf[0];
+    const uint8_t* payload = buf + 1;
+    uint16_t plen = len - 1;
 
-    // Check if we have enough bytes for a marker
-    if (markerPos == MARKER_SIZE_IMG) {
-        // Check for START marker
-        if (checkImageMarker(MARKER_START_IMG)) {
-            // CRITICAL: Clear all text buffers before binary transfer
-            outputBuffer = "";
-            lineBuffer = "";
-
-            // CRITICAL: Flush any pending data before starting new image
-            flushImageWSBuffer();
-
-            // Clear marker buffer completely
-            memset(markerBuffer, 0, MARKER_SIZE_IMG);
-            markerPos = 0;
-
-            // Only send to WebSocket if modal is open
-            if (wsImage.count() > 0) {
-                wsImage.binaryAll(MARKER_START_IMG, MARKER_SIZE_IMG);
-                yield();
-                Serial.println("Image transfer started");
-            } else {
-                Serial.println("Image transfer started (discarding - modal closed)");
-            }
-
-            inImageTransfer = true;
-            imageBytesReceived = 0;
-            return;
-        }
-
-        // Check for END marker
-        if (checkImageMarker(MARKER_END_IMG)) {
-            // CRITICAL: Flush remaining image data
-            flushImageWSBuffer();
-
-            // Clear marker buffer
-            memset(markerBuffer, 0, MARKER_SIZE_IMG);
-            markerPos = 0;
-
-            // Only send to WebSocket if modal is open
-            if (wsImage.count() > 0) {
-                wsImage.binaryAll(MARKER_END_IMG, MARKER_SIZE_IMG);
-                yield();
-                Serial.printf("Image transfer complete: %lu bytes\n", imageBytesReceived);
-            } else {
-                Serial.printf("Image transfer complete (discarded): %lu bytes\n", imageBytesReceived);
-            }
-
-            inImageTransfer = false;
-            return;
-        }
-
-        // Not a marker, buffer oldest byte only if in transfer AND modal is open
-        if (inImageTransfer && wsImage.count() > 0) {
-            wsImageBuffer[wsImageBufferPos++] = markerBuffer[0];
-            imageBytesReceived++;
-
-            if (wsImageBufferPos >= WS_IMAGE_CHUNK_SIZE) {
-                flushImageWSBuffer();
-                yield();
-            }
-        }
-        // If modal closed mid-transfer, silently discard bytes (no panic)
-
-        // Shift buffer left
-        for (int i = 0; i < MARKER_SIZE_IMG - 1; i++) {
-            markerBuffer[i] = markerBuffer[i + 1];
-        }
-        markerPos = MARKER_SIZE_IMG - 1;
+    switch (ftype) {
+        case SLIP_TYPE_NET:
+            inject_packet_from_uart(payload, plen);
+            break;
+        case SLIP_TYPE_IMG_START:
+            handleImageStart();
+            break;
+        case SLIP_TYPE_IMG_DATA:
+            handleImageData(payload, plen);
+            break;
+        case SLIP_TYPE_IMG_END:
+            handleImageEnd();
+            break;
+        default:
+            Serial.printf("[SLIP] Unknown frame type 0x%02X (len=%u)\n", ftype, len);
+            break;
     }
 }
 
 void processSerialData() {
-    static unsigned long lastMemCheck = 0;
     int bytesProcessed = 0;
-    const int MAX_BYTES_PER_LOOP = 256;  // Reduced from 512 to allow more frequent main loop iteration
+    // Drain up to 512 bytes per call — enough to keep pace with 921600 baud SLIP
+    // frames while still returning to loop() frequently for WiFi/WDT tasks.
+    const int MAX_BYTES_PER_LOOP = 512;
 
     while (Serial.available() > 0 && bytesProcessed < MAX_BYTES_PER_LOOP) {
         uint8_t byte = Serial.read();
         bytesProcessed++;
 
-        // Periodic memory check (every 100 bytes)
-        if (bytesProcessed % 100 == 0) {
+        if (bytesProcessed % 64 == 0) {
+            ESP.wdtFeed();
             if (ESP.getFreeHeap() < 4096) {
-                Serial.printf("[WARN] Low memory: %u bytes free\n", ESP.getFreeHeap());
-                // Clear buffers to free memory
                 outputBuffer = "";
-                lineBuffer = "";
+                lineBuffer   = "";
             }
         }
 
-        // CRITICAL: Two-way valve - Binary mode OR Text mode, never both
-        // When screenshot modal is open (wsImage has clients), ONLY process binary
-        if (wsImage.count() > 0) {
-            // Screenshot modal is open - BINARY MODE ONLY
-            processSerialByteForImage(byte);
-
-            // Yield MORE frequently during image transfer to prevent WDT reset
-            if (bytesProcessed % 32 == 0) {
-                yield();
-                ESP.wdtFeed();  // Explicit watchdog feed
-            }
-            continue;  // Skip ALL text processing below
-        }
-
-        // CRITICAL: During image transfer, ONLY process binary data
-        // Skip all text processing to prevent memory conflicts
-        if (inImageTransfer) {
-            processSerialByteForImage(byte);
-            yield();  // Prevent watchdog timeout during large binary transfers
-            ESP.wdtFeed();  // Explicit watchdog feed
-            continue;  // Skip all text processing below
-        }
-
-        // ---------- SLIP frame handler (runs before text mode) ----------
-        // 0xC0 and 0xDB are non-ASCII; they don't appear in AT/HID text commands.
+        // ---------- SLIP frame handler ----------
+        // Handles both NET frames (0x00 type) and image frames (0x01/0x02/0x03).
+        // All binary data from the target arrives SLIP-encoded via the VBS script.
         if (byte == SLIP_END) {
-            if (slip_in_frame && slip_len > 0) {
-                // Dispatch complete SLIP frame → inject into WiFi AP
-                inject_packet_from_uart(slip_buf, slip_len);
+            if (slip_in_frame && slip_len > 0 && !slip_overflow) {
+                dispatch_slip_frame(slip_buf, slip_len);
             }
             slip_in_frame = true;
             slip_len      = 0;
             slip_escape   = false;
+            slip_overflow = false;
             continue;
         }
         if (slip_in_frame) {
@@ -1859,16 +1843,13 @@ void processSerialData() {
                 if (slip_len < SLIP_MAX_FRAME) {
                     slip_buf[slip_len++] = decoded;
                 } else {
-                    // Frame too large — reset
-                    slip_in_frame = false;
-                    slip_len      = 0;
+                    slip_overflow = true;  // Frame too large — mark and keep consuming until END
                 }
             }
             continue;
         }
 
-        // Screenshot modal is closed - TEXT MODE ONLY
-        // Process as text for HID/AT commands
+        // ---------- Text mode (HID intercept data, AT responses, shell frames) ----------
         char c = (char)byte;
 
         // Priority 1: Check for PowerShell response frame markers (RESP_START: ... :RESP_END)
@@ -2045,9 +2026,15 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
     static size_t totalWritten = 0;
     static size_t expectedSize = 0;
     static unsigned long lastProgress = 0;
+    static bool uploadError = false;
 
     if (!index) {
-        // Start of upload - save to LittleFS
+        // Start of upload - close any previously open handle first
+        if (uploadFile) {
+            uploadFile.close();
+        }
+        uploadError = false;
+
         Serial.println("\n========================================");
         Serial.printf("OTA Upload Start: %s\n", filename.c_str());
         Serial.printf("Content-Length: %u bytes\n", request->contentLength());
@@ -2057,16 +2044,28 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
 
         expectedSize = request->contentLength();
 
+        // Reject if clearly not enough LittleFS space
+        FSInfo fs_info;
+        if (LittleFS.info(fs_info)) {
+            size_t freeBytes = fs_info.totalBytes - fs_info.usedBytes;
+            if (expectedSize > 0 && freeBytes < expectedSize) {
+                Serial.printf("ERROR: Not enough LittleFS space (%u free, %u needed)\n", freeBytes, expectedSize);
+                ws.textAll((char*)"OTA_ERROR:Not enough flash space");
+                uploadError = true;
+                return;
+            }
+        }
+
         // Delete old firmware file if exists
         if (LittleFS.exists(OTA_FIRMWARE_FILE)) {
             LittleFS.remove(OTA_FIRMWARE_FILE);
         }
 
-        // Open file for writing
         uploadFile = LittleFS.open(OTA_FIRMWARE_FILE, "w");
         if (!uploadFile) {
             Serial.println("ERROR: Failed to open firmware file for writing");
             ws.textAll((char*)"OTA_ERROR:Failed to open file");
+            uploadError = true;
             return;
         }
 
@@ -2075,31 +2074,37 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
         ws.textAll((char*)"OTA_PROGRESS:0");
     }
 
+    if (uploadError) return;  // skip remaining chunks after error
+
     // Write chunk to LittleFS
-    if (len) {
-        if (uploadFile) {
-            size_t written = uploadFile.write(data, len);
-            if (written != len) {
-                Serial.printf("ERROR: Write failed - wrote %u of %u bytes\n", written, len);
-                uploadFile.close();
-                LittleFS.remove(OTA_FIRMWARE_FILE);
-                ws.textAll((char*)"OTA_ERROR:Write failed");
-                return;
-            }
+    if (len && uploadFile) {
+        size_t written = uploadFile.write(data, len);
 
-            totalWritten += written;
+        // Feed WDT and let TCP stack process ACKs - critical to prevent mid-upload reset.
+        // LittleFS sector erase takes up to 80ms and blocks TCP if we don't yield here.
+        ESP.wdtFeed();
+        yield();
 
-            // Send progress update - calculate percentage if we know expected size
-            if (expectedSize > 0) {
-                int percent = (totalWritten * 100) / expectedSize;
-                unsigned long now = millis();
-                if (now - lastProgress >= 500) {
-                    char progress[32];
-                    snprintf(progress, sizeof(progress), "OTA_PROGRESS:%d", percent);
-                    ws.textAll(progress);
-                    Serial.printf("Upload progress: %u / %u bytes (%d%%)\n", totalWritten, expectedSize, percent);
-                    lastProgress = now;
-                }
+        if (written != len) {
+            Serial.printf("ERROR: Write failed - wrote %u of %u bytes\n", written, len);
+            uploadFile.close();
+            LittleFS.remove(OTA_FIRMWARE_FILE);
+            ws.textAll((char*)"OTA_ERROR:Write failed");
+            uploadError = true;
+            return;
+        }
+
+        totalWritten += written;
+
+        if (expectedSize > 0) {
+            int percent = (int)((totalWritten * 100UL) / expectedSize);
+            unsigned long now = millis();
+            if (now - lastProgress >= 500) {
+                char progress[32];
+                snprintf(progress, sizeof(progress), "OTA_PROGRESS:%d", percent);
+                ws.textAll(progress);
+                Serial.printf("Upload progress: %u / %u bytes (%d%%)\n", totalWritten, expectedSize, percent);
+                lastProgress = now;
             }
         }
     }
@@ -2107,13 +2112,15 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
     // End of upload
     if (final) {
         if (uploadFile) {
+            uploadFile.flush();
             uploadFile.close();
         }
+
+        if (uploadError) return;
 
         Serial.println("========================================");
         Serial.printf("Upload complete: %u bytes written (expected %u)\n", totalWritten, expectedSize);
 
-        // Verify file exists and has content
         if (!LittleFS.exists(OTA_FIRMWARE_FILE)) {
             Serial.println("ERROR: Firmware file not found after upload");
             ws.textAll((char*)"OTA_ERROR:File verification failed");
@@ -2126,10 +2133,8 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
             ws.textAll((char*)"OTA_ERROR:Cannot verify file");
             return;
         }
-
         size_t actualSize = verify.size();
         verify.close();
-
         Serial.printf("Verified size: %u bytes\n", actualSize);
 
         if (actualSize < 100000) {
@@ -2139,32 +2144,27 @@ void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t ind
             return;
         }
 
-        // Create flag file to trigger recovery mode on next boot
         File flagFile = LittleFS.open(OTA_FLAG_FILE, "w");
-        if (flagFile) {
-            flagFile.print("1");
-            flagFile.close();
-            Serial.println("OTA flag set - will enter recovery on reboot");
-        } else {
+        if (!flagFile) {
             Serial.println("ERROR: Failed to create OTA flag");
             ws.textAll((char*)"OTA_ERROR:Flag creation failed");
             return;
         }
+        flagFile.print("1");
+        flagFile.close();
+        Serial.println("OTA flag set - will enter recovery on reboot");
 
-        Serial.println("Firmware file saved successfully");
-
-        // Send 100% progress and success BEFORE reboot
+        // Send progress and reboot notification; yield between sends so WebSocket
+        // can actually flush the frames before ESP.restart() tears everything down.
         ws.textAll((char*)"OTA_PROGRESS:100");
-        delay(100);
+        yield(); delay(50); yield();
         ws.textAll((char*)"OTA_REBOOTING");
-        delay(500);
+        yield(); delay(200); yield();
 
         Serial.println("========================================");
         Serial.println("Rebooting to recovery mode NOW...");
         Serial.println("========================================");
-        delay(200);
 
-        // Reboot to recovery mode
         ESP.restart();
     }
 }
@@ -2372,32 +2372,30 @@ bool should_forward_to_uart_from_pbuf(struct pbuf* p) {
             (dest_ip == rp2040_ip));
 }
 
-// Forward pbuf to RP2040 via SLIP framing
+// Forward pbuf to RP2040 via SLIP framing.
+// Non-blocking: encodes into slip_tx_queue; main loop drains to Serial.
 void forward_pbuf_to_uart(struct pbuf* p) {
     uint16_t total_len = p->tot_len;
     if (total_len == 0 || total_len > SLIP_MAX_FRAME) return;
-
-    if (ESP.getFreeHeap() < 8192) return;  // low-memory guard
+    if (ESP.getFreeHeap() < 8192) return;
 
     uint8_t* buf = (uint8_t*)malloc(total_len);
     if (!buf) return;
-
     pbuf_copy_partial(p, buf, total_len, 0);
 
-    Serial.write(SLIP_END);
+    slip_tx_put(SLIP_END);
     for (uint16_t i = 0; i < total_len; i++) {
         if (buf[i] == SLIP_END) {
-            Serial.write(SLIP_ESC);
-            Serial.write(SLIP_ESC_END);
+            slip_tx_put(SLIP_ESC);
+            slip_tx_put(SLIP_ESC_END);
         } else if (buf[i] == SLIP_ESC) {
-            Serial.write(SLIP_ESC);
-            Serial.write(SLIP_ESC_ESC);
+            slip_tx_put(SLIP_ESC);
+            slip_tx_put(SLIP_ESC_ESC);
         } else {
-            Serial.write(buf[i]);
+            slip_tx_put(buf[i]);
         }
     }
-    Serial.write(SLIP_END);
-
+    slip_tx_put(SLIP_END);
     free(buf);
 }
 
@@ -2717,6 +2715,8 @@ void loop() {
     } else {
         outputBuffer = "";
     }
+
+    drain_slip_tx_queue();  // drain outbound SLIP TX unconditionally
 
     processReplay();
 

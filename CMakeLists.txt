@@ -41,6 +41,8 @@ set(target_name HIDPhantom)
 # Find Python (handles both 'python' on Windows and 'python3' on Unix)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+file(GLOB STORAGE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/storage_files/*")
+
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/storage_data.c
     COMMAND ${CMAKE_COMMAND} -E echo "Generating FAT12 disk image..."
@@ -48,6 +50,7 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/storage_files
             ${CMAKE_CURRENT_BINARY_DIR}/storage_data.c
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_fat12_image.py
+            ${STORAGE_FILES}
     COMMENT "Generating FAT12 disk image from storage_files/"
     VERBATIM
 )
