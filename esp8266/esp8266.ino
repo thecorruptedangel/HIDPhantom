@@ -18,7 +18,8 @@ extern "C" {
 }
 
 // ========== FIRMWARE VERSION ==========
-#define FIRMWARE_VERSION "1.4"
+// BUILD_ID changes every compile — use it to confirm which binary is running
+#define FIRMWARE_VERSION "1.5+" __DATE__ " " __TIME__
 
 // ========== CONFIGURATION ==========
 char AP_SSID[33] = "HID Phantom";  // Max 32 chars + null terminator
@@ -89,6 +90,9 @@ bool storageModeEnabled = false;
 
 // ========== NETWORK BRIDGE MODE STATE ==========
 bool netbridgeModeEnabled = false;
+
+// ========== CLONED BRIDGE MODE STATE ==========
+bool clonedModeActive = false;
 
 // ========== NETWORK BRIDGE INTERNALS ==========
 struct netif* g_ap_netif = NULL;
@@ -1168,6 +1172,19 @@ String processHIDMessage(const String& line) {
     uint16_t dataLen;
     if (!parseHIDLine(line, &reportId, data, &dataLen)) return "";
     if (recState == REC_RECORDING) recordHIDEvent(line);
+    if (clonedModeActive) {
+        // Raw passthrough — don't interpret with composite report IDs.
+        // The real device's descriptor may use different IDs or byte layouts.
+        String raw = String("\xF0\x9F\x93\xA1") + " [" + String(reportId, HEX) + ":";
+        for (uint16_t i = 0; i < dataLen; i++) {
+            if (i > 0) raw += ' ';
+            char hex[3];
+            snprintf(hex, sizeof(hex), "%02X", data[i]);
+            raw += hex;
+        }
+        raw += "]";
+        return raw + "\n";
+    }
     String parsed = hidParser.parseHIDReport(reportId, data, dataLen);
     if (parsed.length() > 0) return parsed + "\n";
     return "";
@@ -1182,6 +1199,21 @@ String processATResponse(const String& line) {
             String ccStr = trimmed.substring(ccPos + 3);
             uint8_t countryCode = strtol(ccStr.c_str(), nullptr, 16);
             hidParser.setLayout(countryCode);
+        }
+        // Parse CLONED bridge mode — simple substring search avoids comma-splitting
+        bool newCloned = (trimmed.indexOf("CLONED=ON") > 0);
+        if (newCloned != clonedModeActive) {
+            clonedModeActive = newCloned;
+            ws.textAll(clonedModeActive ? (char*)"CLONED_STATE:ON" : (char*)"CLONED_STATE:OFF");
+            Serial.printf("[STATE-UPDATE] CLONED bridge mode: %s\n", clonedModeActive ? "active" : "inactive");
+        }
+    }
+    else if (trimmed.startsWith("+CLONED:")) {
+        bool newState = (trimmed.indexOf("ON") > 0);
+        if (newState != clonedModeActive) {
+            clonedModeActive = newState;
+            ws.textAll(clonedModeActive ? (char*)"CLONED_STATE:ON" : (char*)"CLONED_STATE:OFF");
+            Serial.printf("[STATE-UPDATE] CLONED bridge mode: %s\n", clonedModeActive ? "active" : "inactive");
         }
     }
     else if (trimmed.startsWith("+SERIAL:")) {
@@ -1599,6 +1631,14 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
                     Serial.println("[ESP] Serial.flush() completed");
 
                     // No response needed - data is forwarded transparently
+                } else if (strcmp(message, "RESET_FULL") == 0) {
+                    client->text("RESET_FULL_ACK");
+                    delay(200);
+                    performFullReset();
+                } else if (strcmp(message, "RESET_SETTINGS") == 0) {
+                    client->text("RESET_SETTINGS_ACK");
+                    delay(200);
+                    performSettingsReset();
                 } else {
                     // Forward everything else to Serial (AT commands, etc.)
 
@@ -1919,6 +1959,7 @@ void processSerialData() {
                          lineBuffer.startsWith("+SERIAL:") ||
                          lineBuffer.startsWith("+STORAGE:") ||
                          lineBuffer.startsWith("+NETBRIDGE:") ||
+                         lineBuffer.startsWith("+CLONED:") ||
                          lineBuffer.startsWith("ERROR:")) {
 
                     // DEBUG: Log AT response reception
@@ -2022,216 +2063,63 @@ void sendBufferedData() {
 // ========== OTA UPLOAD HANDLER (TWO-STAGE: SAVE TO LITTLEFS) ==========
 
 void handleOTAUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    static File uploadFile;
-    static size_t totalWritten = 0;
-    static size_t expectedSize = 0;
-    static unsigned long lastProgress = 0;
-    static bool uploadError = false;
-
     if (!index) {
-        // Start of upload - close any previously open handle first
-        if (uploadFile) {
-            uploadFile.close();
+        Serial.printf("\nOTA Direct Flash: %s\n", filename.c_str());
+        uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        if (!Update.begin(maxSketchSpace, U_FLASH)) {
+            Update.printError(Serial);
         }
-        uploadError = false;
-
-        Serial.println("\n========================================");
-        Serial.printf("OTA Upload Start: %s\n", filename.c_str());
-        Serial.printf("Content-Length: %u bytes\n", request->contentLength());
-        Serial.printf("Current version: %s\n", FIRMWARE_VERSION);
-        Serial.println("Saving to LittleFS...");
-        Serial.println("========================================");
-
-        expectedSize = request->contentLength();
-
-        // Reject if clearly not enough LittleFS space
-        FSInfo fs_info;
-        if (LittleFS.info(fs_info)) {
-            size_t freeBytes = fs_info.totalBytes - fs_info.usedBytes;
-            if (expectedSize > 0 && freeBytes < expectedSize) {
-                Serial.printf("ERROR: Not enough LittleFS space (%u free, %u needed)\n", freeBytes, expectedSize);
-                ws.textAll((char*)"OTA_ERROR:Not enough flash space");
-                uploadError = true;
-                return;
-            }
-        }
-
-        // Delete old firmware file if exists
-        if (LittleFS.exists(OTA_FIRMWARE_FILE)) {
-            LittleFS.remove(OTA_FIRMWARE_FILE);
-        }
-
-        uploadFile = LittleFS.open(OTA_FIRMWARE_FILE, "w");
-        if (!uploadFile) {
-            Serial.println("ERROR: Failed to open firmware file for writing");
-            ws.textAll((char*)"OTA_ERROR:Failed to open file");
-            uploadError = true;
-            return;
-        }
-
-        totalWritten = 0;
-        lastProgress = 0;
-        ws.textAll((char*)"OTA_PROGRESS:0");
+        pinMode(LED_PIN, OUTPUT);
     }
-
-    if (uploadError) return;  // skip remaining chunks after error
-
-    // Write chunk to LittleFS
-    if (len && uploadFile) {
-        size_t written = uploadFile.write(data, len);
-
-        // Feed WDT and let TCP stack process ACKs - critical to prevent mid-upload reset.
-        // LittleFS sector erase takes up to 80ms and blocks TCP if we don't yield here.
-        ESP.wdtFeed();
-        yield();
-
-        if (written != len) {
-            Serial.printf("ERROR: Write failed - wrote %u of %u bytes\n", written, len);
-            uploadFile.close();
-            LittleFS.remove(OTA_FIRMWARE_FILE);
-            ws.textAll((char*)"OTA_ERROR:Write failed");
-            uploadError = true;
-            return;
-        }
-
-        totalWritten += written;
-
-        if (expectedSize > 0) {
-            int percent = (int)((totalWritten * 100UL) / expectedSize);
-            unsigned long now = millis();
-            if (now - lastProgress >= 500) {
-                char progress[32];
-                snprintf(progress, sizeof(progress), "OTA_PROGRESS:%d", percent);
-                ws.textAll(progress);
-                Serial.printf("Upload progress: %u / %u bytes (%d%%)\n", totalWritten, expectedSize, percent);
-                lastProgress = now;
-            }
+    if (Update.isRunning()) {
+        // Toggle LED each chunk so the user can see upload is active
+        static bool ledState = false;
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+        if (Update.write(data, len) != len) {
+            Update.printError(Serial);
         }
     }
-
-    // End of upload
     if (final) {
-        if (uploadFile) {
-            uploadFile.flush();
-            uploadFile.close();
+        digitalWrite(LED_PIN, HIGH); // LED off
+        if (Update.end(true)) {
+            Serial.printf("OTA Flash OK: %u bytes\n", index + len);
+        } else {
+            Update.printError(Serial);
         }
-
-        if (uploadError) return;
-
-        Serial.println("========================================");
-        Serial.printf("Upload complete: %u bytes written (expected %u)\n", totalWritten, expectedSize);
-
-        if (!LittleFS.exists(OTA_FIRMWARE_FILE)) {
-            Serial.println("ERROR: Firmware file not found after upload");
-            ws.textAll((char*)"OTA_ERROR:File verification failed");
-            return;
-        }
-
-        File verify = LittleFS.open(OTA_FIRMWARE_FILE, "r");
-        if (!verify) {
-            Serial.println("ERROR: Cannot open firmware file for verification");
-            ws.textAll((char*)"OTA_ERROR:Cannot verify file");
-            return;
-        }
-        size_t actualSize = verify.size();
-        verify.close();
-        Serial.printf("Verified size: %u bytes\n", actualSize);
-
-        if (actualSize < 100000) {
-            Serial.printf("ERROR: Firmware too small (%u bytes) - likely corrupt\n", actualSize);
-            LittleFS.remove(OTA_FIRMWARE_FILE);
-            ws.textAll((char*)"OTA_ERROR:Firmware too small");
-            return;
-        }
-
-        File flagFile = LittleFS.open(OTA_FLAG_FILE, "w");
-        if (!flagFile) {
-            Serial.println("ERROR: Failed to create OTA flag");
-            ws.textAll((char*)"OTA_ERROR:Flag creation failed");
-            return;
-        }
-        flagFile.print("1");
-        flagFile.close();
-        Serial.println("OTA flag set - will enter recovery on reboot");
-
-        // Send progress and reboot notification; yield between sends so WebSocket
-        // can actually flush the frames before ESP.restart() tears everything down.
-        ws.textAll((char*)"OTA_PROGRESS:100");
-        yield(); delay(50); yield();
-        ws.textAll((char*)"OTA_REBOOTING");
-        yield(); delay(200); yield();
-
-        Serial.println("========================================");
-        Serial.println("Rebooting to recovery mode NOW...");
-        Serial.println("========================================");
-
-        ESP.restart();
     }
 }
 
 // ========== FACTORY FIRMWARE UPLOAD HANDLER ==========
 
 void handleFactoryFirmwareUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    static File uploadFile;
+    // Saves to LittleFS only — no simultaneous flash write (two SPI ops at once = crash).
+    // Apply via GPIO12 factory restore or /update after copying the file.
+    static File backupFile;
     static size_t totalWritten = 0;
-    static size_t expectedSize = 0;
 
     if (!index) {
-        // Start of upload
-        Serial.println("\n========================================");
-        Serial.printf("Factory Firmware Upload: %s\n", filename.c_str());
-        Serial.printf("Size: %u bytes\n", request->contentLength());
-        Serial.println("========================================");
-
-        expectedSize = request->contentLength();
-
-        // Delete old factory firmware if exists
-        if (LittleFS.exists(FACTORY_FIRMWARE_FILE)) {
-            LittleFS.remove(FACTORY_FIRMWARE_FILE);
-        }
-
-        // Open file for writing
-        uploadFile = LittleFS.open(FACTORY_FIRMWARE_FILE, "w");
-        if (!uploadFile) {
-            Serial.println("ERROR: Failed to open factory firmware file for writing");
-            return;
-        }
-
+        Serial.printf("\nFactory Upload to LittleFS: %s\n", filename.c_str());
+        if (LittleFS.exists(FACTORY_FIRMWARE_FILE)) LittleFS.remove(FACTORY_FIRMWARE_FILE);
+        backupFile = LittleFS.open(FACTORY_FIRMWARE_FILE, "w");
         totalWritten = 0;
+        pinMode(LED_PIN, OUTPUT);
     }
 
-    // Write chunk
     if (len) {
-        if (uploadFile) {
-            size_t written = uploadFile.write(data, len);
-            if (written != len) {
-                Serial.printf("ERROR: Write failed - wrote %u of %u bytes\n", written, len);
-                uploadFile.close();
-                LittleFS.remove(FACTORY_FIRMWARE_FILE);
-                return;
-            }
-            totalWritten += written;
+        static bool ledState = false;
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+        if (backupFile) {
+            backupFile.write(data, len);
+            totalWritten += len;
         }
     }
 
-    // End of upload
     if (final) {
-        if (uploadFile) {
-            uploadFile.close();
-        }
-
-        Serial.println("========================================");
-        Serial.printf("Factory firmware upload complete: %u bytes\n", totalWritten);
-
-        // Verify
-        if (totalWritten < 100000) {
-            Serial.printf("ERROR: Firmware too small (%u bytes)\n", totalWritten);
-            LittleFS.remove(FACTORY_FIRMWARE_FILE);
-            return;
-        }
-
-        Serial.println("Factory firmware saved successfully");
-        Serial.println("========================================");
+        digitalWrite(LED_PIN, HIGH);
+        if (backupFile) backupFile.close();
+        Serial.printf("Factory LittleFS save OK: %u bytes\n", totalWritten);
     }
 }
 
@@ -2651,15 +2539,17 @@ void setup() {
         request->redirect("http://" + apIP.toString());
     });
     
-    // OTA endpoint - saves to LittleFS, sets flag, then reboots to recovery
+    // OTA endpoint - writes directly to flash, reboots on success
     server.on("/update", HTTP_POST,
         [](AsyncWebServerRequest *request) {
-            request->send(200, "text/plain", "OK");
+            bool ok = !Update.hasError();
+            request->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "Flash failed");
+            if (ok) { delay(200); ESP.restart(); }
         },
         handleOTAUpload
     );
 
-    // Factory firmware upload endpoint
+    // Factory firmware upload - saves to LittleFS only (apply via GPIO12 restore or /update)
     server.on("/factory_upload", HTTP_POST,
         [](AsyncWebServerRequest *request) {
             request->send(200, "text/plain", "OK");

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HIDPhantom OTA Tool</title>
+<style>
+body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; }
+h2 { color: #58a6ff; margin-top: 0; }
+label { display: block; margin: 8px 0 4px; color: #8b949e; font-size: 13px; }
+input[type=text], input[type=number] { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 10px; border-radius: 4px; width: 260px; }
+input[type=file] { color: #c9d1d9; margin-top: 4px; }
+button { background: #238636; color: #fff; border: none; padding: 10px 24px; border-radius: 4px; cursor: pointer; font-size: 14px; margin-top: 16px; }
+button:disabled { background: #2d333b; color: #6e7681; cursor: not-allowed; }
+#bar-wrap { background: #161b22; border-radius: 4px; height: 20px; margin-top: 16px; overflow: hidden; display: none; }
+#bar { height: 100%; width: 0; background: #238636; transition: width 0.3s; }
+#status { margin-top: 12px; font-size: 13px; min-height: 18px; }
+.ok { color: #3fb950; } .err { color: #f85149; } .info { color: #58a6ff; }
+.row { display: flex; gap: 16px; }
+.row > div { flex: 1; }
+</style>
+</head>
+<body>
+<h2>HIDPhantom Throttled OTA</h2>
+<p style="color:#8b949e;font-size:13px;margin-top:0">Sends firmware in small chunks with delays to work around the 13% TCP drop. Connect to HIDPhantom WiFi first.</p>
+
+<label>Device IP</label>
+<input type="text" id="ip" value="192.168.4.1">
+
+<label>Firmware (.bin)</label>
+<input type="file" id="fw" accept=".bin">
+
+<div class="row" style="margin-top:12px">
+  <div>
+    <label>Chunk size (bytes)</label>
+    <input type="number" id="chunk" value="512" min="64" max="4096">
+  </div>
+  <div>
+    <label>Delay between chunks (ms)</label>
+    <input type="number" id="delay" value="30" min="0" max="500">
+  </div>
+</div>
+
+<div id="info" style="font-size:13px;color:#8b949e;margin-top:8px"></div>
+
+<button id="btn" onclick="startUpload()">Upload Firmware</button>
+
+<div id="bar-wrap"><div id="bar"></div></div>
+<div id="status"></div>
+
+<script>
+document.getElementById('fw').onchange = function() {
+  const f = this.files[0];
+  if (!f) return;
+  const chunk = +document.getElementById('chunk').value;
+  const delay = +document.getElementById('delay').value;
+  const totalChunks = Math.ceil(f.size / chunk);
+  const est = Math.ceil(totalChunks * delay / 1000);
+  document.getElementById('info').textContent =
+    `File: ${f.name}  |  Size: ${(f.size/1024).toFixed(1)} KB  |  ~${totalChunks} chunks  |  Est. ${est}s`;
+};
+
+function setStatus(msg, cls) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = cls || '';
+}
+
+async function startUpload() {
+  const ip    = document.getElementById('ip').value.trim();
+  const fInput = document.getElementById('fw');
+  const chunk = Math.max(64, +document.getElementById('chunk').value);
+  const delay = Math.max(0,  +document.getElementById('delay').value);
+
+  if (!fInput.files[0]) { setStatus('Select a .bin file first.', 'err'); return; }
+
+  const file = fInput.files[0];
+  const btn  = document.getElementById('btn');
+  btn.disabled = true;
+
+  const boundary = 'HIDPhantomBoundary' + Date.now().toString(16);
+  const prefix   = `--${boundary}\r\nContent-Disposition: form-data; name="firmware"; filename="${file.name}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+  const suffix   = `\r\n--${boundary}--\r\n`;
+
+  const prefixBytes  = new TextEncoder().encode(prefix);
+  const suffixBytes  = new TextEncoder().encode(suffix);
+  const totalBytes   = prefixBytes.length + file.size + suffixBytes.length;
+
+  let sent = 0;
+  function updateBar(n) {
+    sent += n;
+    const pct = Math.round(sent * 100 / totalBytes);
+    document.getElementById('bar').style.width = pct + '%';
+    setStatus(`Uploading… ${pct}%  (${(sent/1024).toFixed(1)} / ${(totalBytes/1024).toFixed(1)} KB)`, 'info');
+  }
+
+  document.getElementById('bar-wrap').style.display = 'block';
+  document.getElementById('bar').style.width = '0%';
+  setStatus('Starting…', 'info');
+
+  // Build a ReadableStream: prefix + throttled file bytes + suffix
+  const fileStream = file.stream();
+  const fileReader = fileStream.getReader();
+
+  let prefixSent  = false;
+  let fileDone    = false;
+  let suffixSent  = false;
+  let fileBuf     = new Uint8Array(0); // leftover from last file read
+
+  const stream = new ReadableStream({
+    async pull(ctrl) {
+      // 1. Send prefix once
+      if (!prefixSent) {
+        prefixSent = true;
+        ctrl.enqueue(prefixBytes);
+        updateBar(prefixBytes.length);
+        await sleep(delay);
+        return;
+      }
+
+      // 2. Stream file in chunk-sized pieces
+      if (!fileDone) {
+        // Refill buffer if empty
+        while (fileBuf.length < chunk) {
+          const { done, value } = await fileReader.read();
+          if (done) { fileDone = true; break; }
+          const merged = new Uint8Array(fileBuf.length + value.length);
+          merged.set(fileBuf);
+          merged.set(value, fileBuf.length);
+          fileBuf = merged;
+        }
+        if (fileBuf.length > 0) {
+          const slice = fileBuf.slice(0, chunk);
+          fileBuf = fileBuf.slice(chunk);
+          ctrl.enqueue(slice);
+          updateBar(slice.length);
+          await sleep(delay);
+          return;
+        }
+      }
+
+      // 3. Send suffix once
+      if (!suffixSent) {
+        suffixSent = true;
+        ctrl.enqueue(suffixBytes);
+        updateBar(suffixBytes.length);
+        await sleep(delay);
+        return;
+      }
+
+      ctrl.close();
+    }
+  });
+
+  try {
+    const resp = await fetch(`http://${ip}/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: stream,
+      duplex: 'half'   // required for streaming body in Chrome 105+
+    });
+
+    if (resp.ok) {
+      document.getElementById('bar').style.width = '100%';
+      setStatus('✓ Upload complete! Device is rebooting and flashing…', 'ok');
+    } else {
+      setStatus(`Server replied ${resp.status}: ${resp.statusText}`, 'err');
+    }
+  } catch (e) {
+    // Device reboots and drops the TCP connection → fetch throws.
+    // If we're at 100%, that's expected (device applied and rebooted).
+    const pct = Math.round(sent * 100 / totalBytes);
+    if (pct >= 95) {
+      document.getElementById('bar').style.width = '100%';
+      setStatus('✓ Upload complete! Device rebooted to apply firmware.', 'ok');
+    } else {
+      setStatus(`✗ Network error at ${pct}% — try reducing chunk size or increasing delay.`, 'err');
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+</script>
+</body>
+</html>
